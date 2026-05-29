@@ -1,0 +1,847 @@
+import crypto from "node:crypto";
+import http from "node:http";
+import { URL } from "node:url";
+import WebSocket from "ws";
+
+const PORT = Number(process.env.BINANCE_PROXY_PORT || 3001);
+const BINANCE_BASE = (process.env.BINANCE_FAPI_BASE || "https://fapi.binance.com").replace(
+  /\/$/,
+  ""
+);
+const BINANCE_WS_BASE = (process.env.BINANCE_FAPI_WS_BASE || "wss://fstream.binance.com").replace(/\/$/, "");
+const ALLOWED_SIGNED_PATHS = new Set([
+  "/fapi/v2/account",
+  "/fapi/v1/order",
+  "/fapi/v1/allOpenOrders",
+  "/fapi/v1/openOrders",
+  "/fapi/v1/userTrades",
+]);
+const ALLOWED_PUBLIC_PATHS = new Set(["/fapi/v1/exchangeInfo", "/fapi/v1/premiumIndex"]);
+const cycleWorkers = new Map();
+const accountStreams = new Map();
+const CYCLE_FALLBACK_POLL_MS = Number(process.env.BINANCE_CYCLE_FALLBACK_POLL_MS || 1500);
+
+function streamTag(stream) {
+  return `[ws ${String(stream?.key || "unknown").slice(0, 18)}]`;
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}
+
+function collectJson(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += String(chunk);
+      if (raw.length > 2_000_000) {
+        reject(new Error("Body too large"));
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function toQuery(params) {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null) continue;
+    usp.set(k, String(v));
+  }
+  return usp.toString();
+}
+
+async function callBinance({ method, path, apiKey, apiSecret, params = {} }) {
+  const timestamp = Date.now();
+  const q = toQuery({ ...params, recvWindow: 5000, timestamp });
+  const signature = crypto.createHmac("sha256", apiSecret).update(q).digest("hex");
+  const url = `${BINANCE_BASE}${path}?${q}&signature=${signature}`;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "X-MBX-APIKEY": apiKey,
+    },
+  });
+  const text = await response.text();
+  let data = text;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // keep text
+  }
+  if (!response.ok) {
+    const msg = data && typeof data === "object" && "msg" in data ? String(data.msg) : text;
+    const err = new Error(msg || response.statusText);
+    err.statusCode = response.status;
+    err.payload = data;
+    throw err;
+  }
+  return data;
+}
+
+async function callPublic(path, params = {}) {
+  const q = toQuery(params);
+  const url = `${BINANCE_BASE}${path}${q ? `?${q}` : ""}`;
+  const response = await fetch(url);
+  const text = await response.text();
+  let data = text;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // keep text
+  }
+  if (!response.ok) {
+    const err = new Error(text || response.statusText);
+    err.statusCode = response.status;
+    err.payload = data;
+    throw err;
+  }
+  return data;
+}
+
+async function callApiKeyOnly({ method, path, apiKey, params = {} }) {
+  const q = toQuery(params);
+  const url = `${BINANCE_BASE}${path}${q ? `?${q}` : ""}`;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "X-MBX-APIKEY": apiKey,
+    },
+  });
+  const text = await response.text();
+  let data = text;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // keep text
+  }
+  if (!response.ok) {
+    const msg = data && typeof data === "object" && "msg" in data ? String(data.msg) : text;
+    const err = new Error(msg || response.statusText);
+    err.statusCode = response.status;
+    err.payload = data;
+    throw err;
+  }
+  return data;
+}
+
+function roundToStep(value, step, mode = "floor") {
+  const v = Number(value);
+  const s = Number(step);
+  if (!(v > 0) || !(s > 0)) return 0;
+  const n = v / s;
+  const rounded = mode === "round" ? Math.round(n) : Math.floor(n);
+  const safe = rounded * s;
+  const precision = Math.max(0, (String(step).split(".")[1] || "").length);
+  return Number(safe.toFixed(precision));
+}
+
+function sidesForDirection(direction) {
+  return direction === "LONG" ? { entrySide: "BUY", tpSide: "SELL" } : { entrySide: "SELL", tpSide: "BUY" };
+}
+
+function newCycleId() {
+  return `cycle_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function placeLimitOrder(worker, { side, quantity, price, reduceOnly }) {
+  const params = {
+    symbol: worker.symbol,
+    side,
+    type: "LIMIT",
+    quantity: String(quantity),
+    price: String(price),
+    timeInForce: "GTC",
+    positionSide: worker.positionSide,
+    reduceOnly: reduceOnly ? "true" : undefined,
+  };
+  if (worker.positionSide === "LONG" || worker.positionSide === "SHORT") {
+    delete params.reduceOnly;
+  }
+  try {
+    return await callBinance({
+      method: "POST",
+      path: "/fapi/v1/order",
+      apiKey: worker.apiKey,
+      apiSecret: worker.apiSecret,
+      params,
+    });
+  } catch (error) {
+    const code =
+      error &&
+      typeof error === "object" &&
+      "payload" in error &&
+      error.payload &&
+      typeof error.payload === "object" &&
+      "code" in error.payload
+        ? Number(error.payload.code)
+        : undefined;
+    if (code === -4061) {
+      const retryParams = { ...params };
+      delete retryParams.positionSide;
+      return callBinance({
+        method: "POST",
+        path: "/fapi/v1/order",
+        apiKey: worker.apiKey,
+        apiSecret: worker.apiSecret,
+        params: retryParams,
+      });
+    }
+    throw error;
+  }
+}
+
+function streamKey(apiKey, apiSecret) {
+  return `${apiKey}::${apiSecret}`;
+}
+
+async function createListenKey(apiKey) {
+  const data = await callApiKeyOnly({
+    method: "POST",
+    path: "/fapi/v1/listenKey",
+    apiKey,
+  });
+  const k = data && typeof data === "object" && "listenKey" in data ? String(data.listenKey || "") : "";
+  if (!k) throw new Error("listenKey missing");
+  return k;
+}
+
+async function keepAliveListenKey(apiKey, listenKey) {
+  await callApiKeyOnly({
+    method: "PUT",
+    path: "/fapi/v1/listenKey",
+    apiKey,
+    params: { listenKey },
+  });
+}
+
+async function closeListenKey(apiKey, listenKey) {
+  await callApiKeyOnly({
+    method: "DELETE",
+    path: "/fapi/v1/listenKey",
+    apiKey,
+    params: { listenKey },
+  });
+}
+
+function dispatchOrderTradeUpdate(stream, payload) {
+  const o = payload?.o;
+  if (!o) return;
+  if (String(o.x || "") !== "TRADE") return;
+  const orderId = Number(o.i);
+  const symbol = String(o.s || "");
+  const side = String(o.S || "");
+  const qty = Number(o.l || 0);
+  const price = Number(o.L || o.ap || 0);
+  if (!(orderId > 0) || !symbol || !(qty > 0)) return;
+  const fill = { orderId, symbol, side, qty, price };
+  stream.lastMessageAt = Date.now();
+  for (const cb of stream.listeners.values()) {
+    try {
+      cb(fill);
+    } catch {
+      // ignore listener errors
+    }
+  }
+}
+
+async function connectAccountStream(stream) {
+  if (stream.connecting || stream.ws) return;
+  stream.connecting = true;
+  console.log(`${streamTag(stream)} connecting...`);
+  try {
+    stream.listenKey = await createListenKey(stream.apiKey);
+    console.log(`${streamTag(stream)} listenKey created`);
+    const wsUrl = `${BINANCE_WS_BASE}/ws/${stream.listenKey}`;
+    const ws = new WebSocket(wsUrl);
+    stream.ws = ws;
+    ws.on("open", () => {
+      stream.connected = true;
+      stream.lastError = "";
+      stream.lastMessageAt = Date.now();
+      console.log(`${streamTag(stream)} connected`);
+    });
+    ws.on("message", (raw) => {
+      try {
+        const payload = JSON.parse(String(raw));
+        if (payload?.e === "ORDER_TRADE_UPDATE") dispatchOrderTradeUpdate(stream, payload);
+      } catch {
+        // ignore malformed messages
+      }
+    });
+    ws.on("error", (err) => {
+      stream.lastError = err instanceof Error ? err.message : "ws error";
+      console.error(`${streamTag(stream)} error: ${stream.lastError}`);
+    });
+    ws.on("close", () => {
+      stream.ws = null;
+      stream.connected = false;
+      console.warn(`${streamTag(stream)} closed`);
+      if (stream.listeners.size > 0) {
+        if (stream.reconnectTimer) clearTimeout(stream.reconnectTimer);
+        stream.reconnectTimer = setTimeout(() => {
+          console.log(`${streamTag(stream)} reconnecting...`);
+          void connectAccountStream(stream);
+        }, 1000);
+      }
+    });
+    if (stream.keepAliveTimer) clearInterval(stream.keepAliveTimer);
+    stream.keepAliveTimer = setInterval(() => {
+      if (!stream.listenKey) return;
+      void keepAliveListenKey(stream.apiKey, stream.listenKey).catch((e) => {
+        stream.lastError = e instanceof Error ? e.message : "listenKey keepalive failed";
+        console.error(`${streamTag(stream)} keepalive error: ${stream.lastError}`);
+      });
+    }, 30 * 60 * 1000);
+  } finally {
+    stream.connecting = false;
+  }
+}
+
+async function getOrCreateAccountStream(apiKey, apiSecret) {
+  const key = streamKey(apiKey, apiSecret);
+  let stream = accountStreams.get(key);
+  if (!stream) {
+    stream = {
+      key,
+      apiKey,
+      apiSecret,
+      listenKey: "",
+      ws: null,
+      listeners: new Map(),
+      keepAliveTimer: null,
+      reconnectTimer: null,
+      connected: false,
+      connecting: false,
+      lastError: "",
+    };
+    accountStreams.set(key, stream);
+    console.log(`${streamTag(stream)} stream created`);
+  }
+  await connectAccountStream(stream);
+  return stream;
+}
+
+async function releaseAccountStream(apiKey, apiSecret, sessionId) {
+  const key = streamKey(apiKey, apiSecret);
+  const stream = accountStreams.get(key);
+  if (!stream) return;
+  stream.listeners.delete(sessionId);
+  console.log(`${streamTag(stream)} detached session ${sessionId}`);
+  if (stream.listeners.size > 0) return;
+  if (stream.keepAliveTimer) clearInterval(stream.keepAliveTimer);
+  if (stream.reconnectTimer) clearTimeout(stream.reconnectTimer);
+  if (stream.ws) {
+    try {
+      stream.ws.close();
+    } catch {
+      // ignore
+    }
+  }
+  if (stream.listenKey) {
+    try {
+      await closeListenKey(stream.apiKey, stream.listenKey);
+      console.log(`${streamTag(stream)} listenKey closed`);
+    } catch {
+      // ignore
+    }
+  }
+  accountStreams.delete(key);
+  console.log(`${streamTag(stream)} stream released`);
+}
+
+function stopCycleWorker(sessionId) {
+  const worker = cycleWorkers.get(sessionId);
+  if (!worker) return null;
+  if (worker.timer) clearInterval(worker.timer);
+  if (worker.pollTimer) clearInterval(worker.pollTimer);
+  void releaseAccountStream(worker.apiKey, worker.apiSecret, worker.sessionId);
+  cycleWorkers.delete(sessionId);
+  return worker;
+}
+
+async function cancelOrderBestEffort(worker, orderId) {
+  try {
+    await callBinance({
+      method: "DELETE",
+      path: "/fapi/v1/order",
+      apiKey: worker.apiKey,
+      apiSecret: worker.apiSecret,
+      params: { symbol: worker.symbol, orderId },
+    });
+    return true;
+  } catch (error) {
+    const code =
+      error &&
+      typeof error === "object" &&
+      "payload" in error &&
+      error.payload &&
+      typeof error.payload === "object" &&
+      "code" in error.payload
+        ? Number(error.payload.code)
+        : undefined;
+    // -2011: unknown order (already filled/canceled); treat as non-fatal.
+    if (code === -2011) return false;
+    return false;
+  }
+}
+
+async function postSplitOrdersFromEntryFill(worker, fillQty) {
+  const { tpSide } = sidesForDirection(worker.direction);
+  for (const row of worker.rows) {
+    const qty = roundToStep(fillQty * (Number(row.percent) / 100), worker.stepSize, "floor");
+    if (!(qty > 0)) continue;
+    const placed = await placeLimitOrder(worker, {
+      side: tpSide,
+      quantity: qty,
+      price: row.price,
+      reduceOnly: true,
+    });
+    const tpId = Number(placed && placed.orderId);
+    if (tpId > 0) {
+      worker.trackedCycleOrderIds.add(tpId);
+      worker.allKnownOrderIds.add(tpId);
+    }
+  }
+}
+
+async function bootstrapWorker(worker) {
+  const entryOrderId = Array.from(worker.trackedEntryOrderIds)[0];
+  if (!(entryOrderId > 0)) return;
+  const o = await callBinance({
+    method: "GET",
+    path: "/fapi/v1/order",
+    apiKey: worker.apiKey,
+    apiSecret: worker.apiSecret,
+    params: { symbol: worker.symbol, orderId: entryOrderId },
+  });
+  const status = String(o?.status ?? "");
+  const executedQty = Number(o?.executedQty ?? 0);
+  if (status === "FILLED" && executedQty > 0) {
+    await postSplitOrdersFromEntryFill(worker, executedQty);
+    worker.trackedEntryOrderIds.delete(entryOrderId);
+  }
+}
+
+async function handleWorkerFill(worker, t) {
+  const orderId = Number(t.orderId);
+  if (!(orderId > 0)) return;
+  const fillQty = Number(t.qty);
+  if (!(fillQty > 0)) return;
+  const tradePrice = Number(t.price);
+  const { entrySide, tpSide } = sidesForDirection(worker.direction);
+
+  if (worker.trackedEntryOrderIds.has(orderId)) {
+    if (String(t.side) !== entrySide) return;
+    await postSplitOrdersFromEntryFill(worker, fillQty);
+    worker.trackedEntryOrderIds.delete(orderId);
+    return;
+  }
+
+  if (!worker.trackedCycleOrderIds.has(orderId)) return;
+  const sourcePrice = worker.anchorSourcePriceByOrderId.get(orderId);
+  const isAnchorFill =
+    sourcePrice !== undefined && Math.abs(tradePrice - Number(worker.anchorPrice)) <= Number(worker.tickSize);
+
+  if (isAnchorFill) {
+    const placed = await placeLimitOrder(worker, {
+      side: tpSide,
+      quantity: fillQty,
+      price: Number(sourcePrice),
+      reduceOnly: true,
+    });
+    const id = Number(placed && placed.orderId);
+    if (id > 0) {
+      worker.trackedCycleOrderIds.add(id);
+      worker.allKnownOrderIds.add(id);
+    }
+    worker.trackedCycleOrderIds.delete(orderId);
+    worker.anchorSourcePriceByOrderId.delete(orderId);
+  } else {
+    const placed = await placeLimitOrder(worker, {
+      side: entrySide,
+      quantity: fillQty,
+      price: worker.anchorPrice,
+      reduceOnly: false,
+    });
+    const id = Number(placed && placed.orderId);
+    if (id > 0) {
+      worker.trackedCycleOrderIds.add(id);
+      worker.anchorSourcePriceByOrderId.set(id, String(tradePrice));
+      worker.allKnownOrderIds.add(id);
+    }
+    worker.trackedCycleOrderIds.delete(orderId);
+  }
+}
+
+async function handleWorkerFillByOrderStatus(worker, orderId, executedQty, orderPrice) {
+  if (!(orderId > 0) || !(executedQty > 0)) return;
+  const { entrySide, tpSide } = sidesForDirection(worker.direction);
+
+  if (worker.trackedEntryOrderIds.has(orderId)) {
+    await postSplitOrdersFromEntryFill(worker, executedQty);
+    worker.trackedEntryOrderIds.delete(orderId);
+    return;
+  }
+
+  if (!worker.trackedCycleOrderIds.has(orderId)) return;
+  const sourcePrice = worker.anchorSourcePriceByOrderId.get(orderId);
+  const isAnchorFill =
+    sourcePrice !== undefined &&
+    Math.abs(orderPrice - Number(worker.anchorPrice)) <= Number(worker.tickSize);
+  if (isAnchorFill) {
+    const placed = await placeLimitOrder(worker, {
+      side: tpSide,
+      quantity: executedQty,
+      price: Number(sourcePrice),
+      reduceOnly: true,
+    });
+    const id = Number(placed && placed.orderId);
+    if (id > 0) {
+      worker.trackedCycleOrderIds.add(id);
+      worker.allKnownOrderIds.add(id);
+    }
+    worker.trackedCycleOrderIds.delete(orderId);
+    worker.anchorSourcePriceByOrderId.delete(orderId);
+  } else {
+    const placed = await placeLimitOrder(worker, {
+      side: entrySide,
+      quantity: executedQty,
+      price: worker.anchorPrice,
+      reduceOnly: false,
+    });
+    const id = Number(placed && placed.orderId);
+    if (id > 0) {
+      worker.trackedCycleOrderIds.add(id);
+      worker.anchorSourcePriceByOrderId.set(id, String(orderPrice > 0 ? orderPrice : worker.anchorPrice));
+      worker.allKnownOrderIds.add(id);
+    }
+    worker.trackedCycleOrderIds.delete(orderId);
+  }
+}
+
+async function pollWorkerOrderStatus(worker) {
+  if (worker.busy) return;
+  worker.busy = true;
+  try {
+    const ids = [
+      ...Array.from(worker.trackedEntryOrderIds),
+      ...Array.from(worker.trackedCycleOrderIds),
+    ]
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+    for (const id of ids) {
+      try {
+        const ord = await callBinance({
+          method: "GET",
+          path: "/fapi/v1/order",
+          apiKey: worker.apiKey,
+          apiSecret: worker.apiSecret,
+          params: { symbol: worker.symbol, orderId: id },
+        });
+        const status = String(ord?.status || "");
+        if (status !== "FILLED") continue;
+        const executedQty = Number(ord?.executedQty || 0);
+        const orderPrice = Number(ord?.price || 0);
+        await handleWorkerFillByOrderStatus(worker, id, executedQty, orderPrice);
+      } catch {
+        // ignore a single order status error
+      }
+    }
+  } catch (error) {
+    worker.lastError = error instanceof Error ? `fallback poll: ${error.message}` : "fallback poll failed";
+  } finally {
+    worker.busy = false;
+  }
+}
+
+async function processWorkerQueue(worker) {
+  if (worker.busy) return;
+  worker.busy = true;
+  try {
+    while (worker.fillQueue.length > 0) {
+      const next = worker.fillQueue.shift();
+      if (!next) continue;
+      if (String(next.symbol || "").toUpperCase() !== worker.symbol) continue;
+      await handleWorkerFill(worker, next);
+    }
+  } catch (error) {
+    worker.lastError = error instanceof Error ? error.message : "cycle worker error";
+  } finally {
+    worker.busy = false;
+  }
+}
+
+function startCycleWorker(worker) {
+  void (async () => {
+    try {
+      const stream = await getOrCreateAccountStream(worker.apiKey, worker.apiSecret);
+      stream.listeners.set(worker.sessionId, (fill) => {
+        worker.fillQueue.push(fill);
+        void processWorkerQueue(worker);
+      });
+      worker.streamKey = stream.key;
+      console.log(`[cycle ${worker.sessionId}] attached to stream ${streamTag(stream)}`);
+    } catch (error) {
+      worker.lastError = error instanceof Error ? error.message : "user stream attach failed";
+      console.error(`[cycle ${worker.sessionId}] attach failed: ${worker.lastError}`);
+    }
+  })();
+  worker.pollTimer = setInterval(() => {
+    const stream = worker.streamKey ? accountStreams.get(worker.streamKey) : null;
+    const streamStale =
+      !!stream &&
+      stream.connected &&
+      Number.isFinite(Number(stream.lastMessageAt)) &&
+      Date.now() - Number(stream.lastMessageAt) > 12_000;
+    // Always protect pending entry detection, even when WS is "connected".
+    const hasPendingEntry = worker.trackedEntryOrderIds.size > 0;
+    // For cycle legs, fallback when stream is missing/disconnected/stale.
+    const needsCycleFallback =
+      worker.trackedCycleOrderIds.size > 0 && (!stream || !stream.connected || streamStale);
+    if (hasPendingEntry || needsCycleFallback) {
+      void pollWorkerOrderStatus(worker);
+    }
+  }, CYCLE_FALLBACK_POLL_MS);
+  cycleWorkers.set(worker.sessionId, worker);
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (!req.url) return sendJson(res, 400, { error: "Missing URL" });
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/binance/public") {
+      const path = url.searchParams.get("path") || "";
+      if (!ALLOWED_PUBLIC_PATHS.has(path)) {
+        return sendJson(res, 400, { error: "Unsupported public path" });
+      }
+      const params = {};
+      for (const [k, v] of url.searchParams.entries()) {
+        if (k === "path") continue;
+        params[k] = v;
+      }
+      const data = await callPublic(path, params);
+      return sendJson(res, 200, data);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/binance/signed") {
+      const body = await collectJson(req);
+      const method = String(body.method || "GET").toUpperCase();
+      const rawPath = String(body.path || "");
+      const path = rawPath.trim().replace(/\/+$/, "");
+      const apiKey = String(body.apiKey || "");
+      const apiSecret = String(body.apiSecret || "");
+      const params = body.params && typeof body.params === "object" ? { ...body.params } : {};
+
+      if (!["GET", "POST", "DELETE"].includes(method)) {
+        return sendJson(res, 400, { error: "Invalid method" });
+      }
+      if (!path) {
+        return sendJson(res, 400, { error: "Missing path" });
+      }
+      if (!ALLOWED_SIGNED_PATHS.has(path)) {
+        return sendJson(res, 400, {
+          error: "Unsupported signed path",
+          path,
+          hint: "Restart the proxy after upgrading (npm run dev:api). Allowed paths match this server version.",
+        });
+      }
+      if (!apiKey || !apiSecret) {
+        return sendJson(res, 400, { error: "Missing API credentials" });
+      }
+
+      // Safety normalization: Binance rejects reduceOnly in Hedge Mode orders
+      // (positionSide LONG/SHORT). Ignore it at the proxy to avoid client mismatch/caching issues.
+      if (path === "/fapi/v1/order") {
+        const ps = typeof params.positionSide === "string" ? params.positionSide.toUpperCase() : "";
+        if (ps === "LONG" || ps === "SHORT") {
+          delete params.reduceOnly;
+        }
+      }
+
+      try {
+        const data = await callBinance({ method, path, apiKey, apiSecret, params });
+        return sendJson(res, 200, data);
+      } catch (error) {
+        // If account is in One-way mode but client sent Hedge positionSide,
+        // auto-retry once without positionSide/reduceOnly to match One-way format.
+        const code =
+          error &&
+          typeof error === "object" &&
+          "payload" in error &&
+          error.payload &&
+          typeof error.payload === "object" &&
+          "code" in error.payload
+            ? Number(error.payload.code)
+            : undefined;
+        // One-way account rejected positionSide — retry without it only.
+        // Keep reduceOnly: stripping it turns reduce-only step limits into opening orders and can
+        // invalidate or auto-cancel other working limits on the same symbol.
+        if (path === "/fapi/v1/order" && code === -4061) {
+          const retryParams = { ...params };
+          delete retryParams.positionSide;
+          const retried = await callBinance({
+            method,
+            path,
+            apiKey,
+            apiSecret,
+            params: retryParams,
+          });
+          return sendJson(res, 200, retried);
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/binance/cycle/start") {
+      const body = await collectJson(req);
+      const apiKey = String(body.apiKey || "");
+      const apiSecret = String(body.apiSecret || "");
+      const symbol = String(body.symbol || "").trim().toUpperCase();
+      const direction = String(body.direction || "").toUpperCase();
+      const anchorPrice = Number(body.anchorPrice);
+      const stepSize = Number(body.stepSize);
+      const tickSize = Number(body.tickSize);
+      const entryOrderId = Number(body.entryOrderId);
+      const positionSideRaw = typeof body.positionSide === "string" ? String(body.positionSide).toUpperCase() : "";
+      const positionSide =
+        positionSideRaw === "LONG" || positionSideRaw === "SHORT" || positionSideRaw === "BOTH"
+          ? positionSideRaw
+          : undefined;
+      const rows = Array.isArray(body.rows)
+        ? body.rows
+            .map((r) => ({ price: Number(r?.price), percent: Number(r?.percent) }))
+            .filter((r) => r.price > 0 && r.percent > 0)
+        : [];
+
+      if (!apiKey || !apiSecret) return sendJson(res, 400, { error: "Missing API credentials" });
+      if (!symbol) return sendJson(res, 400, { error: "Missing symbol" });
+      if (direction !== "LONG" && direction !== "SHORT") {
+        return sendJson(res, 400, { error: "Invalid direction" });
+      }
+      if (!(anchorPrice > 0) || !(stepSize > 0) || !(tickSize > 0) || !(entryOrderId > 0)) {
+        return sendJson(res, 400, { error: "Invalid numeric inputs" });
+      }
+      if (rows.length === 0) return sendJson(res, 400, { error: "Missing rows" });
+
+      const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : newCycleId();
+      stopCycleWorker(sessionId);
+      const worker = {
+        sessionId,
+        apiKey,
+        apiSecret,
+        symbol,
+        direction,
+        anchorPrice,
+        positionSide,
+        stepSize,
+        tickSize,
+        rows,
+        trackedEntryOrderIds: new Set([entryOrderId]),
+        trackedCycleOrderIds: new Set(),
+        anchorSourcePriceByOrderId: new Map(),
+        allKnownOrderIds: new Set([entryOrderId]),
+        timer: null,
+        pollTimer: null,
+        busy: false,
+        lastTradeId: 0,
+        lastError: "",
+      };
+      try {
+        await bootstrapWorker(worker);
+      } catch (error) {
+        worker.lastError = error instanceof Error ? `bootstrap: ${error.message}` : "bootstrap failed";
+      }
+      startCycleWorker(worker);
+      return sendJson(res, 200, { ok: true, sessionId });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/binance/cycle/stop") {
+      const body = await collectJson(req);
+      const sessionId = String(body.sessionId || "").trim();
+      const cancelOrders = body.cancelOrders === true;
+      const fallbackApiKey = String(body.apiKey || "");
+      const fallbackApiSecret = String(body.apiSecret || "");
+      const fallbackSymbol = String(body.symbol || "").trim().toUpperCase();
+      const fallbackOrderIds = Array.isArray(body.knownOrderIds)
+        ? body.knownOrderIds.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+        : [];
+      if (!sessionId) return sendJson(res, 400, { error: "Missing sessionId" });
+      const worker = stopCycleWorker(sessionId);
+      let cancelRequested = 0;
+      let cancelDone = 0;
+      if (!worker) {
+        if (cancelOrders && fallbackApiKey && fallbackApiSecret && fallbackSymbol && fallbackOrderIds.length > 0) {
+          const shadowWorker = {
+            apiKey: fallbackApiKey,
+            apiSecret: fallbackApiSecret,
+            symbol: fallbackSymbol,
+          };
+          cancelRequested = fallbackOrderIds.length;
+          for (const id of fallbackOrderIds) {
+            const done = await cancelOrderBestEffort(shadowWorker, id);
+            if (done) cancelDone += 1;
+          }
+        }
+        return sendJson(res, 200, { ok: true, stopped: false, cancelRequested, cancelDone });
+      }
+      if (cancelOrders) {
+        const ids = Array.from(worker.allKnownOrderIds)
+          .map((x) => Number(x))
+          .filter((x) => Number.isFinite(x) && x > 0);
+        cancelRequested = ids.length;
+        for (const id of ids) {
+          const done = await cancelOrderBestEffort(worker, id);
+          if (done) cancelDone += 1;
+        }
+      }
+      return sendJson(res, 200, { ok: true, stopped: true, cancelRequested, cancelDone });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/binance/cycle/status") {
+      const sessionId = String(url.searchParams.get("sessionId") || "").trim();
+      if (!sessionId) return sendJson(res, 400, { error: "Missing sessionId" });
+      const worker = cycleWorkers.get(sessionId);
+      if (!worker) return sendJson(res, 404, { error: "Not found" });
+      const stream = worker.streamKey ? accountStreams.get(worker.streamKey) : null;
+      return sendJson(res, 200, {
+        ok: true,
+        sessionId,
+        symbol: worker.symbol,
+        direction: worker.direction,
+        trackedEntryCount: worker.trackedEntryOrderIds.size,
+        trackedCycleCount: worker.trackedCycleOrderIds.size,
+        knownOrderIds: Array.from(worker.allKnownOrderIds || []),
+        lastTradeId: worker.lastTradeId,
+        streamConnected: !!stream?.connected,
+        streamError: stream?.lastError || null,
+        lastError: worker.lastError || null,
+      });
+    }
+
+    return sendJson(res, 404, { error: "Not found" });
+  } catch (error) {
+    const statusCode = Number(error.statusCode || 500);
+    return sendJson(res, statusCode, {
+      error: error.message || "Proxy error",
+      details: error.payload || undefined,
+    });
+  }
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`Binance proxy listening on http://127.0.0.1:${PORT}`);
+});
