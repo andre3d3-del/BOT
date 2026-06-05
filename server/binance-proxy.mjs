@@ -3,7 +3,7 @@ import http from "node:http";
 import { URL } from "node:url";
 import WebSocket from "ws";
 
-const PORT = Number(process.env.BINANCE_PROXY_PORT || 3001);
+const PORT = Number(process.env.PORT || process.env.BINANCE_PROXY_PORT || 3001);
 const BINANCE_BASE = (process.env.BINANCE_FAPI_BASE || "https://fapi.binance.com").replace(
   /\/$/,
   ""
@@ -1091,7 +1091,22 @@ function startCycleWorker(worker) {
   cycleWorkers.set(worker.sessionId, worker);
 }
 
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : [];
+
 const server = http.createServer(async (req, res) => {
+  const origin = req.headers["origin"] || "";
+  if (origin && (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
   try {
     if (!req.url) return sendJson(res, 400, { error: "Missing URL" });
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -1409,6 +1424,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Binance proxy listening on http://127.0.0.1:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Binance proxy listening on http://0.0.0.0:${PORT}`);
 });

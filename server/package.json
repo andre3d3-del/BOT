@@ -1,0 +1,11 @@
+{
+  "name": "binance-trading-bot-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node binance-proxy.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
