@@ -1,0 +1,101 @@
+{
+  "_comment": "Copy this file to scripts/config.json and fill in your values. config.json is git-ignored.",
+
+  "trading": {
+    "_comment": "Sub-account (or main account) API keys used for placing orders",
+    "apiKey": "YOUR_TRADING_API_KEY",
+    "apiSecret": "YOUR_TRADING_API_SECRET",
+    "baseUrl": "https://fapi.binance.com"
+  },
+
+  "broker": {
+    "_comment": "Master account API keys — used for sub-account management and fund transfers. Requires 'Enable Reading' + 'Allow Universal Transfer' permissions. NOT the sub-account trading key.",
+    "apiKey": "YOUR_BROKER_API_KEY",
+    "apiSecret": "YOUR_BROKER_API_SECRET"
+  },
+
+  "orderDefaults": {
+    "_comment": "Default values pre-filled in the interactive form",
+    "symbol": "BTCUSDT",
+    "totalUsdt": "2000",
+    "volPct": "12.5",
+    "step": "1"
+  },
+
+  "proxyUrl": "http://localhost:3001",
+
+  "subAccounts": [
+    {
+      "_comment": "Display labels for sub-accounts shown in the 'List Sub-accounts' screen. Use the email address (NOT a numeric ID).",
+      "email": "sub1@example.com",
+      "label": "Bot Account 1"
+    },
+    {
+      "email": "sub2@example.com",
+      "label": "Bot Account 2"
+    },
+    {
+      "email": "sub3@example.com",
+      "label": "Bot Account 3"
+    }
+  ],
+
+  "transferRules": [
+    {
+      "_comment": "Use sub-account email address for 'from'/'to'. Use 'master' for the master account. Emails are shown in 'List Sub-accounts' screen.",
+
+      "_comment1": "PATTERN 1: Pull excess from sub-account to master when balance exceeds threshold",
+      "label": "Pull excess from Sub1 to master",
+      "enabled": true,
+      "from": "sub1@example.com",
+      "to": "master",
+      "asset": "USDT",
+      "futuresType": 1,
+      "keepBalance": 500,
+      "pullAbove": 1000
+    },
+    {
+      "_comment": "PATTERN 2: Top-up sub-account from master when balance drops below threshold",
+      "label": "Top-up Sub2 from master when low",
+      "enabled": true,
+      "from": "master",
+      "to": "sub2@example.com",
+      "asset": "USDT",
+      "futuresType": 1,
+      "topUpTo": 1000,
+      "topUpBelow": 300
+    },
+    {
+      "_comment": "PATTERN 3: Sub-account to sub-account — fixed amount each run",
+      "label": "Sub1 → Sub2 fixed transfer",
+      "enabled": false,
+      "from": "sub1@example.com",
+      "to": "sub2@example.com",
+      "asset": "USDT",
+      "futuresType": 1,
+      "amount": 200
+    },
+    {
+      "_comment": "PATTERN 4: Sub-account to sub-account — pull excess above threshold, keep minimum",
+      "label": "Pull excess from Sub1 to Sub2",
+      "enabled": false,
+      "from": "sub1@example.com",
+      "to": "sub2@example.com",
+      "asset": "USDT",
+      "futuresType": 1,
+      "keepBalance": 500,
+      "pullAbove": 1500
+    },
+    {
+      "_comment": "PATTERN 5: Sub-account to sub-account — top-up Sub3 from Sub2 when Sub3 runs low",
+      "label": "Top-up Sub3 from Sub2",
+      "enabled": false,
+      "from": "sub2@example.com",
+      "to": "sub3@example.com",
+      "asset": "USDT",
+      "futuresType": 1,
+      "topUpTo": 800,
+      "topUpBelow": 200
+    }
+  ]
+}

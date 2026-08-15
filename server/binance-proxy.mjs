@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
-import { URL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, URL } from "node:url";
 import WebSocket from "ws";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT || process.env.BINANCE_PROXY_PORT || 3001);
 const BINANCE_BASE = (process.env.BINANCE_FAPI_BASE || "https://fapi.binance.com").replace(
@@ -24,6 +28,85 @@ const markPriceStreams = new Map(); // symbol → { ws, lastPrice, connecting, c
 const sseClients = new Map(); // clientId → { res, symbol, streamKey }
 let _sseClientId = 0;
 const CYCLE_FALLBACK_POLL_MS = Number(process.env.BINANCE_CYCLE_FALLBACK_POLL_MS || 10000);
+
+// ── htpasswd user management ──────────────────────────────────────────────────
+// HTPASSWD_FILE: path to nginx .htpasswd file (Ubuntu VPS only).
+// ADMIN_TOKEN:   auto-generated on first run and saved to .admin_token next to this file.
+//                Override with ADMIN_TOKEN env var if you prefer.
+const HTPASSWD_FILE = process.env.HTPASSWD_FILE || "/etc/nginx/.htpasswd";
+
+const ADMIN_TOKEN_FILE = join(__dirname, ".admin_token");
+let ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
+if (!ADMIN_TOKEN) {
+  try { ADMIN_TOKEN = fs.readFileSync(ADMIN_TOKEN_FILE, "utf8").trim(); } catch { /* not yet created */ }
+}
+if (!ADMIN_TOKEN) {
+  ADMIN_TOKEN = crypto.randomBytes(32).toString("hex");
+  try { fs.writeFileSync(ADMIN_TOKEN_FILE, ADMIN_TOKEN, "utf8"); } catch { /* ignore write error */ }
+  console.log(`[admin] Generated admin token — saved to ${ADMIN_TOKEN_FILE}`);
+}
+
+// Generates an APR1-MD5 password hash (same format as `htpasswd -m`).
+// Pure Node.js — no external dependencies needed.
+function apr1Md5(password, salt) {
+  const chars = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  if (!salt) salt = Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  const pw = Buffer.from(password, "utf8");
+  const sp = Buffer.from(salt, "utf8");
+  const magic = Buffer.from("$apr1$", "utf8");
+  const ctx = crypto.createHash("md5");
+  ctx.update(pw); ctx.update(magic); ctx.update(sp);
+  const ctx1 = crypto.createHash("md5");
+  ctx1.update(pw); ctx1.update(sp); ctx1.update(pw);
+  let fin = ctx1.digest();
+  for (let pl = pw.length; pl > 0; pl -= 16) ctx.update(fin.slice(0, Math.min(16, pl)));
+  for (let i = pw.length; i; i >>= 1) ctx.update(i & 1 ? Buffer.alloc(1) : pw.slice(0, 1));
+  fin = ctx.digest();
+  for (let i = 0; i < 1000; i++) {
+    const c = crypto.createHash("md5");
+    if (i & 1) c.update(pw); else c.update(fin);
+    if (i % 3) c.update(sp);
+    if (i % 7) c.update(pw);
+    if (i & 1) c.update(fin); else c.update(pw);
+    fin = c.digest();
+  }
+  const to64 = (v, n) => { let r = ""; for (; n-- > 0; v >>= 6) r += chars[v & 0x3f]; return r; };
+  return `$apr1$${salt}$` +
+    to64((fin[0] << 16) | (fin[6]  << 8) | fin[12], 4) +
+    to64((fin[1] << 16) | (fin[7]  << 8) | fin[13], 4) +
+    to64((fin[2] << 16) | (fin[8]  << 8) | fin[14], 4) +
+    to64((fin[3] << 16) | (fin[9]  << 8) | fin[15], 4) +
+    to64((fin[4] << 16) | (fin[10] << 8) | fin[5],  4) +
+    to64(fin[11], 2);
+}
+
+function readHtpasswd() {
+  try {
+    return fs.readFileSync(HTPASSWD_FILE, "utf8")
+      .split("\n").filter(Boolean)
+      .map(line => { const i = line.indexOf(":"); return { username: line.slice(0, i), hash: line.slice(i + 1) }; });
+  } catch { return []; }
+}
+
+function writeHtpasswd(entries) {
+  fs.writeFileSync(HTPASSWD_FILE, entries.map(e => `${e.username}:${e.hash}`).join("\n") + "\n", "utf8");
+}
+
+function htpasswdSet(username, password) {
+  const entries = readHtpasswd();
+  const hash = apr1Md5(password);
+  const idx = entries.findIndex(e => e.username === username);
+  if (idx >= 0) entries[idx].hash = hash; else entries.push({ username, hash });
+  writeHtpasswd(entries);
+}
+
+function htpasswdDelete(username) {
+  writeHtpasswd(readHtpasswd().filter(e => e.username !== username));
+}
+
+function checkAdminToken(body) {
+  return ADMIN_TOKEN && String(body.adminToken || "") === ADMIN_TOKEN;
+}
 
 function streamTag(stream) {
   return `[ws ${String(stream?.key || "unknown").slice(0, 18)}]`;
@@ -176,6 +259,29 @@ async function callBinance({ method, path, apiKey, apiSecret, params = {} }) {
   } catch {
     // keep text
   }
+  if (!response.ok) {
+    const msg = data && typeof data === "object" && "msg" in data ? String(data.msg) : text;
+    const err = new Error(msg || response.statusText);
+    err.statusCode = response.status;
+    err.payload = data;
+    throw err;
+  }
+  return data;
+}
+
+const BROKER_API_BASE = "https://api.binance.com";
+
+async function callBroker({ method, path, apiKey, apiSecret, params = {} }) {
+  const timestamp = Date.now();
+  const q = toQuery({ ...params, recvWindow: 10000, timestamp });
+  const signature = crypto.createHmac("sha256", apiSecret).update(q).digest("hex");
+  // For Binance SAPI endpoints (api.binance.com), all signed params — including for POST —
+  // must be in the URL query string. Putting them in the request body causes -1022 (invalid signature).
+  const url = `${BROKER_API_BASE}${path}?${q}&signature=${signature}`;
+  const response = await fetch(url, { method, headers: { "X-MBX-APIKEY": apiKey } });
+  const text = await response.text();
+  let data = text;
+  try { data = text ? JSON.parse(text) : null; } catch {}
   if (!response.ok) {
     const msg = data && typeof data === "object" && "msg" in data ? String(data.msg) : text;
     const err = new Error(msg || response.statusText);
@@ -1091,6 +1197,230 @@ function startCycleWorker(worker) {
   cycleWorkers.set(worker.sessionId, worker);
 }
 
+// ── Server-side broker helpers (shared by routes + auto-transfer worker) ──────
+
+// Fetch all sub-account USD-M futures balances as [{ email, assets }] where
+// assets[symbol] = { available, wallet }. `available` = maxWithdrawAmount.
+async function fetchBrokerFuturesBalances(brokerKey, brokerSecret) {
+  const listData = await callBroker({
+    method: "GET", path: "/sapi/v1/sub-account/list",
+    apiKey: brokerKey, apiSecret: brokerSecret, params: {},
+  });
+  const emails = Array.isArray(listData?.subAccounts)
+    ? listData.subAccounts.map((a) => String(a.email || "")).filter(Boolean)
+    : [];
+  return Promise.all(emails.map(async (email) => {
+    try {
+      const detail = await callBroker({
+        method: "GET", path: "/sapi/v2/sub-account/futures/account",
+        apiKey: brokerKey, apiSecret: brokerSecret,
+        params: { email, futuresType: 1 },
+      });
+      const rawAssets = Array.isArray(detail?.futureAccountResp?.assets)
+        ? detail.futureAccountResp.assets : [];
+      const assets = {};
+      for (const a of rawAssets) {
+        if (!a.asset) continue;
+        assets[String(a.asset)] = {
+          available: String(a.maxWithdrawAmount ?? "0"),
+          wallet:    String(a.walletBalance    ?? "0"),
+        };
+      }
+      return { email, assets, ok: true };
+    } catch {
+      // Per-account fetch failed — mark ok:false so callers can tell "unknown"
+      // apart from a genuine zero balance (never treat a failed fetch as 0).
+      return { email, assets: {}, ok: false };
+    }
+  }));
+}
+
+const VALID_WALLET_TYPES = new Set(["SPOT", "UMFUTURE", "CMFUTURE", "MARGIN", "ISOLATED_MARGIN", "FUNDING", "OPTIONS", "MAIN"]);
+
+// Execute a single sub-account transfer. Returns Binance's response, or throws
+// an Error with .statusCode / .payload set. Mirrors the /api/broker/transfer route.
+async function executeBrokerTransfer({ brokerKey, brokerSecret, fromEmail, toEmail, asset, amount, fromAccountType, toAccountType, futuresType }) {
+  const amt = Number(amount);
+  if (!(amt > 0)) { const e = new Error("Invalid amount"); e.statusCode = 400; throw e; }
+  const ft = Number(futuresType ?? 1);
+  const fallbackType = ft === 2 ? "CMFUTURE" : "UMFUTURE";
+  const fromT = VALID_WALLET_TYPES.has(String(fromAccountType)) ? String(fromAccountType) : fallbackType;
+  const toT   = VALID_WALLET_TYPES.has(String(toAccountType))   ? String(toAccountType)   : fallbackType;
+  const fe = fromEmail ? String(fromEmail) : null;
+  const te = toEmail   ? String(toEmail)   : null;
+
+  if (fe && te) {
+    if (fromT !== toT) {
+      const e = new Error(
+        `Sub-to-sub cross-wallet transfers are not supported by Binance (${fromT} → ${toT}). ` +
+        `Transfer to master first, then from master to the destination sub-account.`);
+      e.statusCode = 400; throw e;
+    }
+    const futuresTypeVal = fromT === "CMFUTURE" ? 2 : 1;
+    return callBroker({
+      method: "POST", path: "/sapi/v1/sub-account/futures/internalTransfer",
+      apiKey: brokerKey, apiSecret: brokerSecret,
+      params: { fromEmail: fe, toEmail: te, futuresType: futuresTypeVal, asset, amount: String(amt) },
+    });
+  }
+  const params = { fromAccountType: fromT, toAccountType: toT, asset, amount: String(amt) };
+  if (fe) params.fromEmail = fe;
+  if (te) params.toEmail   = te;
+  return callBroker({
+    method: "POST", path: "/sapi/v1/asset/universalTransfer",
+    apiKey: brokerKey, apiSecret: brokerSecret, params,
+  });
+}
+
+// ── Auto-transfer background worker ───────────────────────────────────────────
+// Runs the auto-transfer rule loop inside the always-on proxy process so it keeps
+// running when the browser page is refreshed or closed. Jobs are keyed by broker
+// API key and persisted to disk so a proxy restart resumes them.
+
+const AUTO_JOBS_FILE = join(__dirname, ".auto-transfer-jobs.json");
+const autoTransferJobs = new Map(); // brokerKey → job
+
+const isMasterId = (id) => !id || String(id).toLowerCase() === "master";
+
+function makeAutoLog(rule, status, msg) {
+  return { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, time: new Date().toLocaleTimeString(), rule, status, msg };
+}
+
+// Evaluate every enabled rule once and execute the transfers it calls for.
+async function runAutoRulesOnceServer(job) {
+  // null → the whole balance fetch failed (list call errored) this cycle.
+  const perAccount = await fetchBrokerFuturesBalances(job.brokerKey, job.brokerSecret).catch(() => null);
+  const byEmail = new Map((perAccount || []).map((r) => [r.email, r]));
+  // Returns:
+  //   null → wallet type has no balance data we can read (non-UMFUTURE)
+  //   NaN  → balance is UNKNOWN this cycle (fetch failed) — must not be treated as 0
+  //   number → the actual available balance (a genuine 0 only when the account fetch succeeded)
+  const getAvail = (email, asset, walletType) => {
+    if (walletType !== "UMFUTURE") return null;
+    if (perAccount === null) return NaN;              // list call failed
+    const acct = byEmail.get(email);
+    if (!acct || acct.ok === false) return NaN;       // this account's fetch failed / missing
+    return Number(acct.assets?.[asset]?.available ?? 0);
+  };
+  const UNKNOWN_MSG = "Balance unavailable (API error) — skipped, will retry next cycle";
+
+  const out = [];
+  for (const rule of (job.rules || []).filter((r) => r.enabled)) {
+    const label = rule.label || `${rule.from} → ${rule.to}`;
+    let amount = null;
+    try {
+      if (rule.type === "pull" && rule.pullAbove != null && rule.keepBalance != null && !isMasterId(rule.from)) {
+        const avail = getAvail(rule.from, rule.asset, rule.fromWalletType ?? "UMFUTURE");
+        if (avail === null) { out.push(makeAutoLog(label, "skip", `Balance check not supported for ${rule.fromWalletType} wallet (use Fixed type instead)`)); continue; }
+        if (Number.isNaN(avail)) { out.push(makeAutoLog(label, "skip", UNKNOWN_MSG)); continue; }
+        if (avail > rule.pullAbove) {
+          amount = avail - rule.keepBalance;
+          if (amount <= 0) { out.push(makeAutoLog(label, "skip", "Computed amount ≤ 0")); continue; }
+        } else { out.push(makeAutoLog(label, "skip", `${avail.toFixed(2)} ≤ ${rule.pullAbove} (below threshold)`)); continue; }
+      } else if (rule.type === "topup" && rule.topUpTo != null && rule.topUpBelow != null) {
+        const avail = getAvail(rule.to, rule.asset, rule.toWalletType ?? "UMFUTURE");
+        if (avail === null) { out.push(makeAutoLog(label, "skip", `Balance check not supported for ${rule.toWalletType} wallet (use Fixed type instead)`)); continue; }
+        if (Number.isNaN(avail)) { out.push(makeAutoLog(label, "skip", UNKNOWN_MSG)); continue; }
+        if (avail < rule.topUpBelow) {
+          amount = rule.topUpTo - avail;
+          if (amount <= 0) { out.push(makeAutoLog(label, "skip", "Computed amount ≤ 0")); continue; }
+        } else { out.push(makeAutoLog(label, "skip", `${avail.toFixed(2)} ≥ ${rule.topUpBelow} (above threshold)`)); continue; }
+      } else if (rule.type === "fixed" && rule.amount != null && rule.amount > 0) {
+        amount = rule.amount;
+      } else {
+        out.push(makeAutoLog(label, "skip", "Rule not configured")); continue;
+      }
+
+      const resp = await executeBrokerTransfer({
+        brokerKey: job.brokerKey, brokerSecret: job.brokerSecret,
+        fromEmail: !isMasterId(rule.from) ? rule.from : null,
+        toEmail:   !isMasterId(rule.to)   ? rule.to   : null,
+        asset: rule.asset,
+        amount: amount.toFixed(4),
+        fromAccountType: rule.fromWalletType,
+        toAccountType:   rule.toWalletType,
+      });
+      const txId = resp?.txnId ?? resp?.tranId ?? "—";
+      out.push(makeAutoLog(label, "ok", `Transferred ${amount.toFixed(2)} ${rule.asset} — TxID: ${txId}`));
+    } catch (err) {
+      out.push(makeAutoLog(label, "error", err?.message ?? "Failed"));
+    }
+  }
+  return out;
+}
+
+async function runAutoJobCycle(job) {
+  if (job.cycleInFlight) return; // never overlap cycles for the same job
+  job.cycleInFlight = true;
+  job.lastRunAt = Date.now();
+  job.nextRunAt = Date.now() + job.intervalSec * 1000;
+  try {
+    const entries = await runAutoRulesOnceServer(job);
+    if (entries.length) job.log = [...entries, ...job.log].slice(0, 100);
+  } catch (err) {
+    job.log = [makeAutoLog("auto", "error", err?.message ?? "cycle failed"), ...job.log].slice(0, 100);
+  } finally {
+    job.cycleInFlight = false;
+  }
+}
+
+function stopAutoJob(brokerKey) {
+  const job = autoTransferJobs.get(brokerKey);
+  if (!job) return;
+  if (job.timer) clearInterval(job.timer);
+  job.timer = null;
+  job.running = false;
+}
+
+function persistAutoJobs() {
+  try {
+    const arr = Array.from(autoTransferJobs.values())
+      .filter((j) => j.running)
+      .map((j) => ({ brokerKey: j.brokerKey, brokerSecret: j.brokerSecret, rules: j.rules, intervalSec: j.intervalSec }));
+    fs.writeFileSync(AUTO_JOBS_FILE, JSON.stringify(arr, null, 2), "utf8");
+  } catch (err) {
+    console.error(`[auto] failed to persist jobs: ${err.message}`);
+  }
+}
+
+// Start (or restart) a job. Fires one cycle immediately when `immediate` is set,
+// then repeats on the interval. Starts each run with a fresh activity log.
+function startAutoJob({ brokerKey, brokerSecret, rules, intervalSec, immediate = true }) {
+  stopAutoJob(brokerKey);
+  const sec = Math.max(10, Number(intervalSec) || 60);
+  const job = {
+    brokerKey, brokerSecret,
+    rules: Array.isArray(rules) ? rules : [],
+    intervalSec: sec,
+    running: true,
+    timer: null,
+    log: [], // fresh log on each explicit start; use /auto/clear-log to clear while running
+    lastRunAt: null,
+    nextRunAt: null,
+    cycleInFlight: false,
+  };
+  autoTransferJobs.set(brokerKey, job);
+  if (immediate) void runAutoJobCycle(job);
+  job.timer = setInterval(() => void runAutoJobCycle(job), sec * 1000);
+  persistAutoJobs();
+  return job;
+}
+
+function loadAutoJobs() {
+  let arr;
+  try { arr = JSON.parse(fs.readFileSync(AUTO_JOBS_FILE, "utf8")); } catch { return; }
+  if (!Array.isArray(arr)) return;
+  let resumed = 0;
+  for (const j of arr) {
+    if (j?.brokerKey && j?.brokerSecret) {
+      // Resume without firing immediately — avoids a burst of transfers on restart.
+      startAutoJob({ brokerKey: j.brokerKey, brokerSecret: j.brokerSecret, rules: j.rules, intervalSec: j.intervalSec, immediate: false });
+      resumed++;
+    }
+  }
+  if (resumed) console.log(`[auto] resumed ${resumed} auto-transfer job(s) from disk`);
+}
+
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
   : [];
@@ -1414,6 +1744,197 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, clearedEntries: cleared });
     }
 
+    // ── Sub-account API routes ────────────────────────────────────────────────
+    // Uses standard master-account sub-account endpoints (no Exchange Link required).
+    // Required permissions: "Enable Reading" + "Allow Universal Transfer".
+
+    // List all sub-accounts
+    if (req.method === "POST" && url.pathname === "/api/broker/accounts") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      const brokerSecret = String(body.brokerSecret || "");
+      if (!brokerKey || !brokerSecret) return sendJson(res, 400, { error: "Missing broker credentials" });
+      try {
+        const data = await callBroker({ method: "GET", path: "/sapi/v1/sub-account/list", apiKey: brokerKey, apiSecret: brokerSecret, params: {} });
+        const raw = Array.isArray(data?.subAccounts) ? data.subAccounts : [];
+        const accounts = raw.map((a) => ({ email: String(a.email || "") })).filter((a) => a.email);
+        return sendJson(res, 200, { accounts });
+      } catch (err) {
+        return sendJson(res, err.statusCode || 500, { error: err.message, code: err.payload?.code });
+      }
+    }
+
+    // Get all sub-account USDT-M futures balances, broken down per asset.
+    // Uses /sapi/v2/sub-account/futures/account per sub-account (parallel) so we get
+    // maxWithdrawAmount per asset (USDT, USDC, BNB …), which is the only accurate number
+    // for "how much of this coin can actually be transferred out right now".
+    if (req.method === "POST" && url.pathname === "/api/broker/balances") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      const brokerSecret = String(body.brokerSecret || "");
+      if (!brokerKey || !brokerSecret) return sendJson(res, 400, { error: "Missing broker credentials" });
+      try {
+        const perAccount = await fetchBrokerFuturesBalances(brokerKey, brokerSecret);
+        return sendJson(res, 200, { futuresSummary: perAccount });
+      } catch (err) {
+        return sendJson(res, err.statusCode || 500, { error: err.message, code: err.payload?.code });
+      }
+    }
+
+    // Execute a sub-account transfer.
+    // Sub→Sub (same futures wallet): /sapi/v1/sub-account/futures/internalTransfer
+    // Master↔Sub (any wallet type):  /sapi/v1/asset/universalTransfer
+    // Binance's universalTransfer does NOT support both fromEmail+toEmail simultaneously
+    // on regular (non-broker) accounts — it returns 404.
+    if (req.method === "POST" && url.pathname === "/api/broker/transfer") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      const brokerSecret = String(body.brokerSecret || "");
+      if (!brokerKey || !brokerSecret) return sendJson(res, 400, { error: "Missing broker credentials" });
+      const amount = Number(body.amount);
+      if (!(amount > 0)) return sendJson(res, 400, { error: "Invalid amount" });
+      const asset = String(body.asset || "USDT");
+
+      try {
+        const data = await executeBrokerTransfer({
+          brokerKey, brokerSecret,
+          fromEmail: body.fromEmail ? String(body.fromEmail) : null,
+          toEmail:   body.toEmail   ? String(body.toEmail)   : null,
+          asset, amount,
+          fromAccountType: body.fromAccountType,
+          toAccountType:   body.toAccountType,
+          futuresType:     body.futuresType,
+        });
+        return sendJson(res, 200, data);
+      } catch (err) {
+        return sendJson(res, err.statusCode || 500, { error: err.message, code: err.payload?.code });
+      }
+    }
+
+    // ── Auto-transfer background worker routes ────────────────────────────────
+    // The rule loop runs inside this always-on proxy process (keyed by broker key),
+    // so it keeps executing when the browser page is refreshed or closed.
+
+    // Start / restart a job with the given rules + interval. Fires one cycle now.
+    if (req.method === "POST" && url.pathname === "/api/broker/auto/start") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      const brokerSecret = String(body.brokerSecret || "");
+      if (!brokerKey || !brokerSecret) return sendJson(res, 400, { error: "Missing broker credentials" });
+      const rules = Array.isArray(body.rules) ? body.rules : [];
+      const job = startAutoJob({ brokerKey, brokerSecret, rules, intervalSec: body.intervalSec });
+      return sendJson(res, 200, {
+        ok: true, running: true, intervalSec: job.intervalSec,
+        rules: job.rules, log: job.log, lastRunAt: job.lastRunAt, nextRunAt: job.nextRunAt,
+      });
+    }
+
+    // Update a running job's rules / interval without firing an immediate cycle.
+    if (req.method === "POST" && url.pathname === "/api/broker/auto/update") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      if (!brokerKey) return sendJson(res, 400, { error: "Missing broker credentials" });
+      const job = autoTransferJobs.get(brokerKey);
+      if (!job || !job.running) return sendJson(res, 404, { error: "No running job" });
+      if (Array.isArray(body.rules)) job.rules = body.rules;
+      if (body.intervalSec != null) {
+        const sec = Math.max(10, Number(body.intervalSec) || 60);
+        if (sec !== job.intervalSec) {
+          job.intervalSec = sec;
+          if (job.timer) clearInterval(job.timer);
+          job.timer = setInterval(() => void runAutoJobCycle(job), sec * 1000);
+        }
+      }
+      persistAutoJobs();
+      return sendJson(res, 200, { ok: true, running: true, intervalSec: job.intervalSec });
+    }
+
+    // Stop a running job. Pass `purge: true` (used by Factory Reset) to also drop the
+    // job and its activity log from memory so nothing reappears on reconnect.
+    if (req.method === "POST" && url.pathname === "/api/broker/auto/stop") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      if (!brokerKey) return sendJson(res, 400, { error: "Missing broker credentials" });
+      stopAutoJob(brokerKey);
+      if (body.purge) autoTransferJobs.delete(brokerKey);
+      persistAutoJobs();
+      const job = autoTransferJobs.get(brokerKey);
+      return sendJson(res, 200, { ok: true, running: false, log: job?.log ?? [] });
+    }
+
+    // Poll job status — used by the page to hydrate state after a refresh and to
+    // stream the activity log while running.
+    if (req.method === "POST" && url.pathname === "/api/broker/auto/status") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      if (!brokerKey) return sendJson(res, 400, { error: "Missing broker credentials" });
+      const job = autoTransferJobs.get(brokerKey);
+      if (!job) return sendJson(res, 200, { ok: true, running: false, rules: [], log: [], intervalSec: null });
+      return sendJson(res, 200, {
+        ok: true, running: !!job.running, intervalSec: job.intervalSec,
+        rules: job.rules, log: job.log, lastRunAt: job.lastRunAt, nextRunAt: job.nextRunAt,
+      });
+    }
+
+    // Clear the activity log for a job (running or stopped) so old history stops
+    // reappearing when the page polls status.
+    if (req.method === "POST" && url.pathname === "/api/broker/auto/clear-log") {
+      const body = await collectJson(req);
+      const brokerKey = String(body.brokerKey || "");
+      if (!brokerKey) return sendJson(res, 400, { error: "Missing broker credentials" });
+      const job = autoTransferJobs.get(brokerKey);
+      if (job) job.log = [];
+      return sendJson(res, 200, { ok: true, log: [] });
+    }
+
+    // ── Admin: htpasswd user management ─────────────────────────────────────
+    // Token is auto-generated on startup. Frontend fetches it via /api/admin/my-token.
+
+    // Returns the admin token — the site's htpasswd login already acts as the auth gate here.
+    if (req.method === "GET" && url.pathname === "/api/admin/my-token") {
+      return sendJson(res, 200, { token: ADMIN_TOKEN });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/list-users") {
+      const body = await collectJson(req);
+      if (!checkAdminToken(body)) return sendJson(res, 403, { error: "Unauthorized" });
+      if (!fs.existsSync(HTPASSWD_FILE)) {
+        return sendJson(res, 200, { users: [], warning: `htpasswd file not found at ${HTPASSWD_FILE} (Windows / no nginx?)` });
+      }
+      return sendJson(res, 200, { users: readHtpasswd().map(e => e.username) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/set-password") {
+      const body = await collectJson(req);
+      if (!checkAdminToken(body)) return sendJson(res, 403, { error: "Unauthorized" });
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      if (!username) return sendJson(res, 400, { error: "Missing username" });
+      if (password.length < 4) return sendJson(res, 400, { error: "Password must be at least 4 characters" });
+      if (!fs.existsSync(HTPASSWD_FILE) && !body.createFile) {
+        return sendJson(res, 400, { error: `htpasswd file not found at ${HTPASSWD_FILE}. On Windows, htpasswd is managed by your web server.` });
+      }
+      try {
+        htpasswdSet(username, password);
+        return sendJson(res, 200, { ok: true });
+      } catch (err) {
+        return sendJson(res, 500, { error: err.message });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/delete-user") {
+      const body = await collectJson(req);
+      if (!checkAdminToken(body)) return sendJson(res, 403, { error: "Unauthorized" });
+      const username = String(body.username || "").trim();
+      if (!username) return sendJson(res, 400, { error: "Missing username" });
+      try {
+        htpasswdDelete(username);
+        return sendJson(res, 200, { ok: true });
+      } catch (err) {
+        return sendJson(res, 500, { error: err.message });
+      }
+    }
+
     return sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     const statusCode = Number(error.statusCode || 500);
@@ -1426,4 +1947,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Binance proxy listening on http://0.0.0.0:${PORT}`);
+  loadAutoJobs();
 });

@@ -1,6 +1,6 @@
-import { Bot, LayoutDashboard, Settings, Zap } from "lucide-react";
+import { ArrowLeftRight, Bot, LayoutDashboard, Settings, Zap } from "lucide-react";
 
-type Tab = "dashboard" | "bots" | "settings";
+type Tab = "dashboard" | "bots" | "transfers" | "settings";
 
 export function TopNav({
   tab,
@@ -12,13 +12,14 @@ export function TopNav({
   activeSymbol?: string;
 }) {
   const navItems: { id: Tab; label: string; icon: typeof Bot }[] = [
-    { id: "dashboard", label: "Home", icon: LayoutDashboard },
-    { id: "bots", label: "Bot", icon: Bot },
-    { id: "settings", label: "Settings", icon: Settings },
+    { id: "dashboard", label: "Home",      icon: LayoutDashboard },
+    { id: "bots",      label: "Bot",       icon: Bot },
+    { id: "transfers", label: "Transfers", icon: ArrowLeftRight },
+    { id: "settings",  label: "Settings",  icon: Settings },
   ];
 
   return (
-    <header className="flex h-14 shrink-0 items-center border-b border-slate-200 bg-white px-4 sm:px-6">
+    <header className="hidden h-14 shrink-0 items-center border-b border-slate-200 bg-white px-4 sm:px-6 md:flex">
       {/* Logo */}
       <div className="flex items-center gap-2.5 pr-8">
         <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-600">

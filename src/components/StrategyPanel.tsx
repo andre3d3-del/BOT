@@ -600,12 +600,12 @@ export function StrategyPanel({ symbol }: { symbol: string }) {
      Left: config form   Right: live orders
   ───────────────────────────────────────────── */
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-full w-full flex-col overflow-y-auto pb-16 md:flex-row md:overflow-hidden md:pb-0">
 
       {/* ═══════════════════════════════════════
           LEFT PANEL — Strategy configuration
       ═══════════════════════════════════════ */}
-      <div className="flex w-[420px] shrink-0 flex-col overflow-y-auto border-r border-slate-200 bg-white">
+      <div className="flex w-full flex-col border-b border-slate-200 bg-white md:w-[420px] md:shrink-0 md:overflow-y-auto md:border-b md:border-r">
         {/* Panel header */}
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3.5">
           <div className="flex items-center gap-2">
@@ -861,7 +861,7 @@ export function StrategyPanel({ symbol }: { symbol: string }) {
       {/* ═══════════════════════════════════════
           RIGHT PANEL — Live orders & sessions
       ═══════════════════════════════════════ */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-slate-50">
+      <div className="flex w-full flex-col bg-slate-50 md:min-w-0 md:flex-1 md:overflow-hidden">
 
         {/* Panel header */}
         <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5 py-3.5">
@@ -949,7 +949,7 @@ export function StrategyPanel({ symbol }: { symbol: string }) {
         )}
 
         {/* Open orders + Recent fills share the remaining vertical space */}
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="flex flex-col md:min-h-0 md:flex-1 md:overflow-hidden">
 
           {/* Open orders — 60 % of the shared area */}
           <div className="min-h-0 flex-[3] overflow-y-auto">
