@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "start:api": "node server/binance-proxy.mjs",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "bot": "node scripts/bot.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.511.0",
